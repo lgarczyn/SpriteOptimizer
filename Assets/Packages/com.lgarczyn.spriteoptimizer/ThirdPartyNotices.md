@@ -1,0 +1,1 @@
+Triangulation uses the Triangle.Net library based on the work of Jonathan Richard Shewchuk. It is authorized for redistribution in non-commercial products. https://www.cs.cmu.edu/~quake/triangle.html
