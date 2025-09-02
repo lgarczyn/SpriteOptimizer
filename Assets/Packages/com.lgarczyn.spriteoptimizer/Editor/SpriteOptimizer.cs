@@ -1,133 +1,81 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Linq;
-using TriangleNet.Geometry;
-using TriangleNet.Meshing;
-using TriangleNet.Topology;
+using NetTopologySuite.Geometries;
+using NetTopologySuite.Geometries.Implementation;
+using NetTopologySuite.Operation.Polygonize;
+using NetTopologySuite.Simplify;
+using NetTopologySuite.Triangulate.Polygon;
+using NetTopologySuite.Triangulate.Tri;
 using UnityEngine;
+// Float array to store coordinates compactly and with less GC pressure
+using Loop = NetTopologySuite.Geometries.Implementation.PackedFloatCoordinateSequence;
 
 [Serializable]
 public struct SpriteOptimizer
 {
-    [Header("Quality")]
-    [Range(0, 180)]
-    public double MaximumAngle;
-
-    [Range(0, 180)]
-    public double MinimumAngle;
-
-    [Min(0)]
-    public int SteinerPoints;
-
-    [Header("Constraints")]
-    public bool Holes;
-
-    public bool ConformingDelaunay;
+    public bool ExtractOnlyPolygonal;
+    public bool IsCheckingRingsValid;
 
     [Header("Cleaning")]
-    [Range(0, 2)] public float AreaIncreaseTolerance;
-    [Range(0, 2)] public float AreaDecreaseTolerance;
-    [Range(0, 100)] public int CleanSteps;
+    [Min(0)]
+    public float AreaIncreaseTolerance;
 
-    public IEnumerable<string> GetWarnings()
-    {
-        if (MinimumAngle > MaximumAngle && MaximumAngle > 0)
-        {
-            yield return "Minimum angle is greater than maximum angle.";
-        }
-        else if (MinimumAngle > 120)
-        {
-            yield return "Minimum angle above 120 is not supported.";
-        }
-        else if (MinimumAngle > 40)
-        {
-            yield return "Minimum angle above 40 degrees may cause excessive triangles.";
-        }
-        if (MaximumAngle is > 0 and < 90)
-        {
-            yield return "Maximum angle below 100 may cause excessive triangles.";
-        }
+    [Range(0, 1)]
+    public float Tightness;
 
-        if (Holes)
-        {
-            yield return "If encountering invalid meshes, try disabling holes.";
-        }
-
-        if (CleanSteps > 0 && AreaDecreaseTolerance > 0)
-        {
-            yield return "Removing surface area may cause some parts of the sprite to be cut off.";
-        }
-    }
+    [Range(0, 1000)]
+    public int CleanSteps;
 
     /// <summary>
-    /// Simple struct to represent an directed edge
+    /// Ensure geometries are build as packed float for best performance
     /// </summary>
-    private struct Edge : IEquatable<Edge>
+    private static readonly GeometryFactory GeomFact = new(
+        PrecisionModel.FloatingSingle.Value,
+        0,
+        new PackedCoordinateSequenceFactory());
+
+    public (Vector2[] Vertices, ushort[] Triangles) GetOptimizedMesh(Sprite sprite)
     {
-        public readonly int A;
-        public readonly int B;
-
-        public Edge(int a, int b)
-        {
-            A = a;
-            B = b;
-        }
-
-        public bool Equals(Edge other)
-        {
-            return A == other.A
-                && B == other.B;
-        }
-
-        public override          bool Equals(object obj)                 => obj is Edge other && Equals(other);
-        public readonly override int  GetHashCode()                      => HashCode.Combine(A, B);
-        public static            bool operator ==(Edge left, Edge right) => left.Equals(right);
-        public static            bool operator !=(Edge left, Edge right) => !left.Equals(right);
-
-        public readonly override string ToString() => $"({A}->{B})";
-    }
-
-    private IMesh GetOptimizedMesh(Sprite sprite)
-    {
+        // Get mesh data from sprite
         ushort[] triangles = sprite.triangles;
-        Vector2[] vertices = sprite.vertices;
+        Vector2[] vertices = sprite.GetVerticesFinalCoordinates();
 
-        ILookup<int, Edge> edges = GetEdgeMap(triangles);
+        // Build a directed edge graph from the triangles
+        ILookup<int, DirectedEdge> edges = GetEdgeMap(triangles);
         List<List<int>> contours = GetContours(edges);
+        Loop[] loops = GetLoops(contours, vertices);
 
-        for (int i = 0; i < contours.Count; i++)
+        // Calculate the maximum bounds out of which we can create new vertices
+        Rect bounds = new(0, 0, sprite.texture.width, sprite.texture.height);
+        bounds.min -= Vector2.one * 0.001f;
+        bounds.max += Vector2.one * 0.001f;
+
+        // Extend clipped corners
+        for (int i = 0; i < loops.Length; i++)
         {
-            contours[i] = CleanLoop(contours[i], vertices);
+            Loop collapsed = CustomCollapse(loops[i], bounds);
+            // If loop collapsed to nothing, ignore it
+            if (collapsed.Count > 3)
+            {
+                loops[i] = collapsed;
+            }
         }
-
-        Polygon poly = GetPolygon(vertices, contours, Holes);
-
-        // Since we want to do CVT smoothing, ensure that the mesh
-        // is conforming Delaunay.
-        ConstraintOptions options = new()
+        // Polygonize the loops to get valid polygons
+        Polygonizer polygonizer = new(ExtractOnlyPolygonal);
+        polygonizer.IsCheckingRingsValid = IsCheckingRingsValid;
+        foreach (Loop loop in loops.ToArray())
         {
-            ConformingDelaunay = ConformingDelaunay,
-        };
-
-        // Set maximum area quality option (we don't need to set a minimum
-        // angle, since smoothing will improve the triangle shapes).
-        QualityOptions quality = new()
-        {
-            MaximumAngle = MaximumAngle,
-            MinimumAngle = MinimumAngle,
-            SteinerPoints = SteinerPoints,
-        };
-
-        // Generate mesh using the polygons Triangulate extension method.
-        return poly.Triangulate(options, quality);
-    }
-
-    public (Vector2[] Vertices, ushort[] Triangles) GetUnityMesh(Sprite sprite)
-    {
-        IMesh mesh = GetOptimizedMesh(sprite);
-        Vector2[] unityVerts = GetUnityVerts(sprite, mesh, out Dictionary<int, int> indexMap);
-        ushort[] unityTris = GetUnityTriangles(mesh, indexMap);
-        return (unityVerts, unityTris);
+            polygonizer.Add(GeomFact.CreateLinearRing(loop));
+        }
+        Geometry geom = polygonizer.GetGeometry();
+        // Simplify the hull and holes
+        Geometry simplified = SimplifyHull(geom);
+        // Turn the geometry into a triangulated mesh
+        ConstrainedDelaunayTriangulator triangulator = new(simplified);
+        IList<Tri> mesh = triangulator.GetTriangles();
+        // Convert to Unity format
+        return GetUnityVerts(sprite, mesh);
     }
 
     /// <summary>
@@ -137,8 +85,33 @@ public struct SpriteOptimizer
     /// <param name="sprite"></param>
     public void Optimize(Sprite sprite)
     {
-        (Vector2[] verts, ushort[] tris) = GetUnityMesh(sprite);
+        (Vector2[] verts, ushort[] tris) = GetOptimizedMesh(sprite);
         sprite.OverrideGeometry(verts, tris);
+    }
+
+    /// <summary>
+    /// The signed area of the triangle formed by points a, b, and c.
+    /// Positive if a->b->c is counter-clockwise, negative if clockwise, 0 if degenerate.
+    /// </summary>
+    public static float SignedArea(Vector2 a, Vector2 b, Vector2 c)
+    {
+        float ax = a.x, ay = a.y;
+        float bx = b.x, by = b.y;
+        float cx = c.x, cy = c.y;
+
+        float cross = (by - ay) * (cx - ax) - (bx - ax) * (cy - ay);
+        return 0.5f * cross;
+    }
+
+    /// <summary>
+    /// Apply hull simplification to the geometry
+    /// </summary>
+    private Geometry SimplifyHull(Geometry geom)
+    {
+        PolygonHullSimplifier simp = new(geom, true);
+        simp.AreaDeltaRatio = 0.01f;
+        simp.VertexNumFraction = Tightness;
+        return simp.GetResult();
     }
 
     /// <summary>
@@ -146,65 +119,95 @@ public struct SpriteOptimizer
     /// Use different tolerances for adding and removing area, since removing is far more dangerous.
     /// Increase tolerances over multiple steps to start with low hanging fruits
     /// </summary>
-    private List<int> CleanLoop(List<int> contour, Vector2[] vertices)
+    private Loop CustomCollapse(Loop loop, Rect bounds)
     {
-        contour = contour.ToList();
+        int realCount = loop.Count - 1;
         for (int s = 0; s < CleanSteps; s++)
         {
             float permissiveRatio = (float)(s + 1) / CleanSteps;
-            float maxRemove = permissiveRatio * AreaDecreaseTolerance;
             float maxAdd = permissiveRatio * AreaIncreaseTolerance;
-            for (int i = 0; i < contour.Count; i++)
+
+            for (int i = 0; i < realCount; i++)
             {
-                int prevI = (i - 1 + contour.Count) % contour.Count;
-                int nextI = (i + 1) % contour.Count;
+                int a = i;
+                int b = (i + 1) % realCount;
+                int c = (i + 2) % realCount;
+                int d = (i + 3) % realCount;
 
-                Vector2 prev = vertices[contour[prevI]];
-                Vector2 current = vertices[contour[i]];
-                Vector2 next = vertices[contour[nextI]];
+                Vector2 la1 = loop.Get(a);
+                Vector2 la2 = loop.Get(b);
+                Vector2 lb1 = loop.Get(c);
+                Vector2 lb2 = loop.Get(d);
 
-                float area = (prev.x * (current.y - next.y)
-                            + current.x * (next.y - prev.y)
-                            + next.x * (prev.y - current.y));
-
-                if ((area < 0 && -area < maxRemove) || (area > 0 && area < maxAdd))
+                Vector2 intersection = Vector2.zero;
+                bool intersects = false;
                 {
-                    contour.RemoveAt(i);
-                    i++;
+                    float denominator = (la1.x - la2.x) * (lb1.y - lb2.y) - (la1.y - la2.y) * (lb1.x - lb2.x);
+                    if (Mathf.Abs(denominator) > 0.0001f)
+                    {
+                        float t = ((la1.x - lb1.x) * (lb1.y - lb2.y) - (la1.y - lb1.y) * (lb1.x - lb2.x)) / denominator;
+                        float u = -((la1.x - la2.x) * (la1.y - lb1.y) - (la1.y - la2.y) * (la1.x - lb1.x)) / denominator;
+                        intersection = new Vector2(la1.x + t * (la2.x - la1.x), la1.y + t * (la2.y - la1.y));
+                        intersects = t >= 0 && u <= 0 && bounds.Contains(intersection);
+                    }
+                }
+                if (!intersects)
+                {
+                    continue;
+                }
+
+                float area = SignedArea(la2, intersection, lb1);
+                bool yes = (area >= 0 && area < maxAdd);
+                if (yes)
+                {
+                    loop.Set(b, intersection);
+                    loop.Set(c, intersection);
                 }
             }
         }
 
-        return contour;
+        loop.Set(realCount, loop.Get(0));
+        return loop;
     }
 
-    private static Vector2[] GetUnityVerts(Sprite sprite, IMesh mesh, out Dictionary<int, int> indexMap)
+    /// <summary>
+    /// Convert a NetTopologySuite triangulated mesh to Unity format
+    /// Super annoying since NTS doesn't give us vertices, only triangles with coordinates
+    /// We have to deduplicate vertices ourselves and then reindex triangles
+    /// </summary>
+    private static (Vector2[] Vertices, ushort[] Triangles) GetUnityVerts(Sprite sprite, IList<Tri> mesh)
     {
-        Vector2[] unityVerts = new Vector2[mesh.Vertices.Count];
-        indexMap = new(mesh.Vertices.Count);
+        ushort[] unityTris = new ushort[mesh.Count * 3];
+        Dictionary<Coordinate, int> visited = new();
 
         int vertexIndex = 0;
-        foreach (Vertex vertex in mesh.Vertices)
+        for (int i = 0; i < mesh.Count; i++)
         {
-            Vector2 unityVert = new((float)vertex.X, (float)vertex.Y);
-            unityVerts[vertexIndex] = unityVert;
-            indexMap[vertex.ID] = vertexIndex;
-            vertexIndex++;
+            Tri tri = mesh[i];
+            for (int j = 0; j < 3; j++)
+            {
+                Coordinate coord = tri.GetCoordinate(j);
+                if (!visited.TryGetValue(coord, out int index))
+                {
+                    index = vertexIndex++;
+                    visited[coord] = index;
+                }
+
+                unityTris[i * 3 + j] = (ushort)index;
+            }
         }
 
-        Rect bounds = new Rect(0, 0, sprite.texture.width, sprite.texture.height);
-        Vector2 pivot = sprite.pivot;
-        float ppu = sprite.pixelsPerUnit;
-        for (int i = 0; i < unityVerts.Length; i++)
+        Vector2[] unityVerts = new Vector2[visited.Count];
+        foreach ((Coordinate coord, int index) in visited)
         {
-            Vector2 objectSpace = unityVerts[i];
-            Vector2 textureSpace = objectSpace * ppu + pivot;
-            unityVerts[i] = textureSpace;
+            unityVerts[index] = new Vector2((float)coord.X, (float)coord.Y);
         }
+
+        Rect bounds = new(0, 0, sprite.texture.width, sprite.texture.height);
 
         for (int i = 0; i < unityVerts.Length; i++)
         {
-            var textureSpace = unityVerts[i];
+            Vector2 textureSpace = unityVerts[i];
             // mini margin to shut up unity warnings
             Vector2 bounded = new(
                 Mathf.Clamp(textureSpace.x, bounds.xMin + 0.0001f, bounds.xMax - 0.0001f),
@@ -213,80 +216,18 @@ public struct SpriteOptimizer
             unityVerts[i] = bounded;
         }
 
-        return unityVerts;
-    }
-
-    private static ushort[] GetUnityTriangles(IMesh mesh, Dictionary<int, int> indexMap)
-    {
-        ushort[] unityTris = new ushort[mesh.Triangles.Count * 3];
-        int ti = 0;
-
-        foreach (Triangle tri in mesh.Triangles)
-        {
-            unityTris[ti++] = (ushort)indexMap[tri.GetVertex(0).ID];
-            unityTris[ti++] = (ushort)indexMap[tri.GetVertex(1).ID];
-            unityTris[ti++] = (ushort)indexMap[tri.GetVertex(2).ID];
-        }
-
-        return unityTris;
-    }
-
-    /// <summary>
-    /// Create a Triangle.Net polygon from the given vertices and contours
-    /// </summary>
-    private static Polygon GetPolygon(Vector2[] vertices, List<List<int>> contours, bool withHoles)
-    {
-        Polygon poly = new();
-
-        // Negative if loop is a hole
-        float SignedArea(List<int> loop)
-        {
-            float area = 0;
-            for (int i = 0; i < loop.Count; i++)
-            {
-                Vector2 p1 = vertices[loop[i]];
-                Vector2 p2 = vertices[loop[(i + 1) % loop.Count]];
-                area += (p2.x - p1.x) * (p2.y + p1.y);
-            }
-
-            return area;
-        }
-
-        foreach (List<int> loop in contours)
-        {
-            if (loop.Count < 3)
-            {
-                continue;
-            }
-
-            bool isHole = SignedArea(loop) < 0;
-            List<Vertex> verts = new(loop.Count);
-
-            foreach (int t in loop)
-            {
-                Vector2 v = vertices[t];
-                verts.Add(new Vertex(v.x, v.y));
-            }
-
-            Contour contour = new(verts, 0, true);
-            if (!isHole || withHoles)
-            {
-                poly.Add(contour, isHole);
-            }
-        }
-
-        return poly;
+        return (unityVerts, unityTris);
     }
 
     /// <summary>
     /// Get oriented contours from the edge map
     /// </summary>
-    private static List<List<int>> GetContours(ILookup<int, Edge> edges)
+    private static List<List<int>> GetContours(ILookup<int, DirectedEdge> edges)
     {
         List<List<int>> contours = new();
-        HashSet<Edge> used = new();
+        HashSet<DirectedEdge> used = new();
 
-        foreach (Edge start in edges.SelectMany(g => g))
+        foreach (DirectedEdge start in edges.SelectMany(g => g))
         {
             if (used.Contains(start))
             {
@@ -294,7 +235,7 @@ public struct SpriteOptimizer
             }
 
             List<int> loop = new();
-            Edge current = start;
+            DirectedEdge current = start;
 
             do
             {
@@ -305,7 +246,7 @@ public struct SpriteOptimizer
                 }
 
                 current = edges[current.B].FirstOrDefault(e => !used.Contains(e));
-            } while (current != new Edge());
+            } while (current != new DirectedEdge());
 
             contours.Add(loop);
         }
@@ -314,12 +255,39 @@ public struct SpriteOptimizer
     }
 
     /// <summary>
+    /// Get NTS coordinate sequences from contours
+    /// Last vertex is a duplicate of the first to close the loop
+    /// </summary>
+    private static Loop[] GetLoops(List<List<int>> contours, Vector2[] vertices)
+    {
+        Loop[] loops = new Loop[contours.Count];
+        for (int i = 0; i < contours.Count; i++)
+        {
+            List<int> contour = contours[i];
+            Loop loop = new(contour.Count + 1, 2, 0);
+
+            for (int j = 0; j < contour.Count; j++)
+            {
+                int index = contour[j];
+                Vector2 vec = vertices[index];
+                loop.SetX(j, vec.x);
+                loop.SetY(j, vec.y);
+            }
+            loop.SetX(contour.Count, loop.GetX(0));
+            loop.SetY(contour.Count, loop.GetY(0));
+            loops[i] = loop;
+        }
+
+        return loops;
+    }
+
+    /// <summary>
     /// Calculate a list of unique external edges indexed by their parent edge end index
     /// Allows following edges to create contours
     /// </summary>
-    private static ILookup<int, Edge> GetEdgeMap(ushort[] triangles)
+    private static ILookup<int, DirectedEdge> GetEdgeMap(ushort[] triangles)
     {
-        HashSet<Edge> edges = new();
+        HashSet<DirectedEdge> edges = new();
 
         for (int i = 0; i < triangles.Length; i += 3)
         {
@@ -334,8 +302,8 @@ public struct SpriteOptimizer
 
         void AddEdge(int i1, int i2)
         {
-            Edge edge = new(i1, i2);
-            Edge revEdge = new(i2, i1);
+            DirectedEdge edge = new(i1, i2);
+            DirectedEdge revEdge = new(i2, i1);
             // If reverse edge exists, remove it (we only want boundary edges)
             if (edges.Remove(revEdge))
             {

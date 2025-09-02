@@ -12,13 +12,9 @@ class SpriteOptimizerSettings : ScriptableSingleton<SpriteOptimizerSettings>
     [SerializeField]
     private SpriteOptimizer m_Optimizer = new()
     {
-        MinimumAngle = 20,
-        Holes = false,
         CleanSteps = 100,
-        ConformingDelaunay = true,
         AreaIncreaseTolerance = 0.6f,
-        AreaDecreaseTolerance = 0,
-        SteinerPoints = 1000,
+        Tightness = 0,
     };
 
     public static bool IsAllowed(string path)
@@ -101,11 +97,6 @@ class SpriteOptimizerSettingsProvider : SettingsProvider
 
         SpriteOptimizer opt = SpriteOptimizerSettings.instance.Optimizer;
 
-        foreach (string warning in opt.GetWarnings())
-        {
-            EditorGUILayout.HelpBox(warning, MessageType.Warning);
-        }
-
         DrawPreview();
     }
 
@@ -154,19 +145,25 @@ class SpriteOptimizerSettingsProvider : SettingsProvider
         {
             current++;
             // Start import
-            AssetDatabase.ImportAsset(path, ImportAssetOptions.ForceUpdate | ImportAssetOptions.ForceSynchronousImport | ImportAssetOptions.ImportRecursive);
+            AssetDatabase.ImportAsset(
+                path,
+                ImportAssetOptions.ForceUpdate
+              | ImportAssetOptions.ForceSynchronousImport
+              | ImportAssetOptions.ImportRecursive);
             // Display progress bar
             if (EditorUtility.DisplayCancelableProgressBar("Reimporting Sprites", path, (float)current / total))
             {
                 Debug.Log($"Reimport cancelled, processed {current}/{total} sprites.");
                 break;
             }
+
             // Force wait for import to finish
             AssetDatabase.StartAssetEditing();
             AssetDatabase.StopAssetEditing();
             // Await minimum time to prevent AssetDatabase overriding progress bar
             await Task.Delay(0);
         }
+
         // Leave
         EditorUtility.ClearProgressBar();
         AssetDatabase.Refresh();
@@ -223,7 +220,7 @@ class SpriteOptimizerSettingsProvider : SettingsProvider
         {
             try
             {
-                (vertices, triangles) = SpriteOptimizerSettings.instance.Optimizer.GetUnityMesh(sprite);
+                (vertices, triangles) = SpriteOptimizerSettings.instance.Optimizer.GetOptimizedMesh(sprite);
             }
             catch (Exception e)
             {
@@ -233,12 +230,8 @@ class SpriteOptimizerSettingsProvider : SettingsProvider
         }
         else
         {
-            vertices = sprite.vertices;
+            vertices = sprite.GetVerticesFinalCoordinates();
             triangles = sprite.triangles;
-            for (int i = 0; i < vertices.Length; ++i)
-            {
-                vertices[i] = vertices[i] * sprite.pixelsPerUnit + sprite.pivot;
-            }
         }
 
         EditorGUI.DrawRect(rect, Color.gray);
@@ -247,12 +240,41 @@ class SpriteOptimizerSettingsProvider : SettingsProvider
         Rect subRect = GetSubRect(rect, sprite);
 
         DrawSprite(subRect, sprite);
-        DrawMesh(subRect, sprite, vertices, triangles);
+        DrawMesh(subRect, sprite, vertices, triangles, optimized);
+        DrawMetaData(rect, sprite.textureRect.size, vertices, triangles);
     }
 
-    private static void DrawMesh(Rect rect, Sprite spr, Vector2[] vertices, ushort[] triangles)
+    private static void DrawMetaData(Rect rect, Vector2 size, Vector2[] vertices, ushort[] triangles)
     {
-        Handles.color = Color.green;
+        // draw background for text
+        Rect textRect = new(rect)
+        {
+            height = 60,
+        };
+        EditorGUI.DrawRect(textRect, new Color(0, 0, 0, 0.8f));
+        float perimeter = 0;
+        float surfaceArea = size.x * size.y;
+        float usedArea = 0;
+        // get triangle total perimeter and area
+        for (int i = 0; i < triangles.Length; i += 3)
+        {
+            Vector2 v0 = vertices[triangles[i + 0]];
+            Vector2 v1 = vertices[triangles[i + 1]];
+            Vector2 v2 = vertices[triangles[i + 2]];
+
+            perimeter +=  Vector2.Distance(v0, v1) + Vector2.Distance(v1, v2) + Vector2.Distance(v2, v0);
+            usedArea += Mathf.Abs((v1.x - v0.x) * (v2.y - v0.y) - (v2.x - v0.x) * (v1.y - v0.y)) * 0.5f;
+        }
+
+        perimeter /= surfaceArea;
+        usedArea /= surfaceArea;
+        string text = $"Vertices: {vertices.Length}\nTriangles: {triangles.Length / 3}\nPerimeter: {perimeter:P}\nCover: {usedArea:P}";
+        textRect.xMin += 5;
+        EditorGUI.LabelField(textRect, text);
+    }
+
+    private static void DrawMesh(Rect rect, Sprite spr, Vector2[] vertices, ushort[] triangles, bool optimized)
+    {
         vertices = vertices.ToArray();
 
         Rect textureRect = spr.textureRect;
@@ -262,6 +284,8 @@ class SpriteOptimizerSettingsProvider : SettingsProvider
         Vector2 mult1 = Vector2.one / textureRect.size;
         Vector2 mult2 = new(rect.size.x, -rect.size.y);
         Vector2 offset2 = rect.center;
+
+        Handles.color = Color.green;
 
         for (int i = 0; i < triangles.Length; i += 3)
         {
